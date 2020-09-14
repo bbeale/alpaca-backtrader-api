@@ -7,8 +7,8 @@ ALPACA_API_KEY = "<key_id>"
 ALPACA_SECRET_KEY = "<secret_key>"
 # change to True if you want to do live paper trading with Alpaca Broker.
 #  False will do a back test
-ALPACA_PAPER = False
-
+IS_BACKTEST = False
+SYMBOL = 'AA'
 
 class SmaCross1(bt.Strategy):
     # list of parameters which are configurable for the strategy
@@ -55,17 +55,19 @@ class SmaCross1(bt.Strategy):
 
     def next(self):
         # if fast crosses slow to the upside
-        if not self.positionsbyname["AAPL"].size:
+        if not self.positionsbyname[SYMBOL].size:
             if self.crossover > 0 or self.crossup > 0:
                 self.buy(data=data0, size=5)  # enter long
 
         # in the market & cross to the downside
-        if self.positionsbyname["AAPL"].size:
+        if self.positionsbyname[SYMBOL].size:
             if self.crossover <= 0 or self.crossdown < 0:
                 self.close(data=data0)  # close long position
 
 
 if __name__ == '__main__':
+    import logging
+    logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
     cerebro = bt.Cerebro()
     cerebro.addstrategy(SmaCross1)
 
@@ -77,19 +79,21 @@ if __name__ == '__main__':
     )
 
     DataFactory = store.getdata  # or use alpaca_backtrader_api.AlpacaData
-    if ALPACA_PAPER:
-        data0 = DataFactory(dataname='AAPL',
+    if IS_BACKTEST:
+        data0 = DataFactory(dataname=SYMBOL, historical=True,
+                            fromdate=datetime(
+                                2015, 1, 1), timeframe=bt.TimeFrame.Days)
+
+    else:
+        data0 = DataFactory(dataname=SYMBOL,
                             historical=False,
                             timeframe=bt.TimeFrame.Days)
         # or just alpaca_backtrader_api.AlpacaBroker()
         broker = store.getbroker()
         cerebro.setbroker(broker)
-    else:
-        data0 = DataFactory(dataname='AAPL', historical=True, fromdate=datetime(
-            2015, 1, 1), timeframe=bt.TimeFrame.Days)
     cerebro.adddata(data0)
 
-    if not ALPACA_PAPER:
+    if IS_BACKTEST:
         # backtrader broker set initial simulated cash
         cerebro.broker.setcash(100000.0)
 

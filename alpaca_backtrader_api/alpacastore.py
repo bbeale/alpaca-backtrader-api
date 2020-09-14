@@ -2,9 +2,13 @@ from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 import collections
-from datetime import datetime, timedelta
+from enum import Enum
+import traceback
+
+from datetime import datetime, timedelta, time as dtime
 from dateutil.parser import parse as date_parse
 import time as _time
+import trading_calendars
 import threading
 import asyncio
 
@@ -15,9 +19,10 @@ import pandas as pd
 
 import backtrader as bt
 from alpaca_trade_api.entity import Aggs
-from alpaca_trade_api.polygon.entity import NY
 from backtrader.metabase import MetaParams
 from backtrader.utils.py3 import queue, with_metaclass
+
+NY = 'America/New_York'
 
 
 # Extend the exceptions to support extra cases
@@ -85,6 +90,11 @@ class API(tradeapi.REST):
         return None
 
 
+class Granularity(Enum):
+    Daily = "day"
+    Minute = "minute"
+
+
 class Streamer:
     conn = None
 
@@ -96,6 +106,7 @@ class Streamer:
             instrument='',
             method='',
             base_url='',
+            data_url='',
             data_stream='',
             *args,
             **kwargs):
@@ -295,12 +306,11 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         # poslist = positions.get('positions', [])
         return positions
 
-    def get_granularity(self, timeframe, compression):
+    def get_granularity(self, timeframe, compression) -> Granularity:
         if timeframe == bt.TimeFrame.Minutes:
-            return "minute"
+            return Granularity.Minute
         elif timeframe == bt.TimeFrame.Days:
-            return "day"
-        return None
+            return Granularity.Daily
 
     def get_instrument(self, dataname):
         try:
@@ -376,106 +386,296 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
 
     def _t_candles(self, dataname, dtbegin, dtend, timeframe, compression,
                    candleFormat, includeFirst, q):
+        granularity: Granularity = self.get_granularity(timeframe, compression)
+        dtbegin, dtend = self._make_sure_dates_are_initialized_properly(
+            dtbegin, dtend, granularity)
 
-        granularity = self.get_granularity(timeframe, compression)
         if granularity is None:
-            e = AlpacaTimeFrameError()
+            e = AlpacaTimeFrameError('granularity is missing')
             q.put(e.error_response)
             return
+        try:
+            if self.p.usePolygon:
+                cdl = self.get_aggs_from_polygon(dataname,
+                                                 dtbegin,
+                                                 dtend,
+                                                 granularity.value,
+                                                 compression)
+            else:
+                cdl = self.get_aggs_from_alpaca(dataname,
+                                                dtbegin,
+                                                dtend,
+                                                granularity.value,
+                                                compression)
+        except AlpacaError as e:
+            print(str(e))
+            q.put(e.error_response)
+            q.put(None)
+            return
+        except Exception:
+            traceback.print_exc()
+            q.put({'code': 'error'})
+            q.put(None)
+            return
 
-        dtkwargs = {'start': None, 'end': None}
-        if not dtend:
-            dtend = datetime.utcnow()
-        if not dtbegin:
-            days = 30 if 'd' in granularity else 3
-            delta = timedelta(days=days)
-            dtbegin = dtend - delta
-        dtkwargs['start'] = dtbegin
-        end_dt = None
-        dtkwargs['end'] = dtend
-        end_dt = dtend.isoformat()
-
-        cdl = pd.DataFrame()
-        prevdt = 0
-
-        while True:
-            try:
-                start_dt = None
-                if dtkwargs['start']:
-                    start_dt = dtkwargs['start'].isoformat()
-                if self.p.usePolygon:
-                    response = \
-                        self.oapi.polygon.historic_agg_v2(
-                            dataname,
-                            compression,
-                            granularity,
-                            _from=self.iso_date(start_dt),
-                            to=self.iso_date(end_dt))
-                else:
-                    # response = self.oapi.get_aggs(dataname,
-                    #                               compression,
-                    #                               granularity,
-                    #                               self.iso_date(start_dt),
-                    #                               self.iso_date(end_dt))
-                    # so get_aggs work nicely for days but not for minutes, and
-                    # it is not a documented API. barset on the other hand does
-                    # but we need to manipulate it to be able to work with it
-                    # smoothly and return data the same way polygon does
-                    response = self.oapi.get_barset(
-                        dataname,
-                        granularity,
-                        start=start_dt,
-                        end=end_dt)[dataname]._raw
-                    for bar in response:
-                        # Aggs are in milliseconds, we multiply by 1000 to
-                        # change seconds to ms
-                        bar['t'] *= 1000
-                    response = Aggs({"results": response})
-            except AlpacaError as e:
-                print(str(e))
-                q.put(e.error_response)
-                q.put(None)
-                return
-            except Exception as e:
-                print(str(e))
-                q.put({'code': 'error'})
-                q.put(None)
-                return
-
-            # No result from the server, most likely error
-            if response.df.shape[0] == 0:
-                print(response)
-                q.put({'code': 'error'})
-                q.put(None)
-                return
-            temp = response.df
-            cdl.update(temp)
-            cdl = pd.concat([cdl, temp])
-            cdl = cdl[~cdl.index.duplicated()]
-            prevdt = dtkwargs['start']
-            dtkwargs['start'] = cdl.index[-1].to_pydatetime()
-
-            if prevdt == dtkwargs['start']:  # end of the data
-                break
-
-        freq = str(compression) + ('D' if 'd' in granularity else 'T')
-
-        cdl = cdl.resample(freq).agg({'open': 'first',
-                                      'high': 'max',
-                                      'low': 'min',
-                                      'close': 'last',
-                                      'volume': 'sum'})
         # don't use dt.replace. use localize
         # (https://stackoverflow.com/a/1592837/2739124)
         cdl = cdl.loc[
-              pytz.timezone(NY).localize(dtbegin):
-              pytz.timezone(NY).localize(dtbegin)
+              pytz.timezone(NY).localize(dtbegin) if
+              not dtbegin.tzname() else dtbegin:
+              pytz.timezone(NY).localize(dtend) if
+              not dtend.tzname() else dtend
               ].dropna(subset=['high'])
         records = cdl.reset_index().to_dict('records')
         for r in records:
             r['time'] = r['timestamp']
             q.put(r)
         q.put({})  # end of transmission
+
+    def _make_sure_dates_are_initialized_properly(self, dtbegin, dtend,
+                                                  granularity):
+        """
+        dates may or may not be specified by the user.
+        when they do, they are probably don't include NY timezome data
+        also, when granularity is minute, we want to make sure we get data when
+        market is opened. so if it doesn't - let's get set end date to be last
+        known minute with opened market.
+        this nethod takes care of all these issues.
+        :param dtbegin:
+        :param dtend:
+        :param granularity:
+        :return:
+        """
+        if not dtend:
+            dtend = pd.Timestamp('now', tz=NY)
+        else:
+            dtend = pd.Timestamp(pytz.timezone(NY).localize(dtend))
+        if granularity == Granularity.Minute:
+            calendar = trading_calendars.get_calendar(name='NYSE')
+            if pd.Timestamp('now', tz=NY).date() == dtend.date():
+                if calendar.is_open_on_minute(dtend):
+                    # we execute during market open, we don't want today's data
+                    # we will receive it through the websocket
+                    dtend = dtend.replace(hour=15,
+                                          minute=59,
+                                          second=0,
+                                          microsecond=0)
+                    dtend -= timedelta(days=1)
+            while not calendar.is_open_on_minute(dtend):
+                dtend = dtend.replace(hour=15,
+                                      minute=59,
+                                      second=0,
+                                      microsecond=0)
+                dtend -= timedelta(days=1)
+        if not dtbegin:
+            days = 30 if granularity == Granularity.Daily else 3
+            delta = timedelta(days=days)
+            dtbegin = dtend - delta
+        else:
+            dtbegin = pd.Timestamp(pytz.timezone(NY).localize(dtbegin))
+        return dtbegin, dtend
+
+    def get_aggs_from_polygon(self,
+                              dataname,
+                              dtbegin,
+                              dtend,
+                              granularity,
+                              compression):
+        """
+        so polygon has a much more convenient api for this than alpaca because
+        we could insert the compression in to the api call and we don't need to
+        resample it. but, at this point in time, something is not working
+        properly and data is returned in segments. meaning, we have patches of
+        missing data. e.g we request data from 2020-03-01 to 2020-07-01 and we
+        get something like this: 2020-03-01:2020-03-15, 2020-06-25:2020-07-01
+        so that makes life difficult.. there's no way to know which patch will
+        be returned and which one we should try to get again.
+        so the solution must be, ask data in segments. I select an arbitrary
+        time window of 2 weeks, and split the calls until we get all required
+        data
+        """
+        def _clear_out_of_market_hours(df):
+            """
+            only interested in samples between 9:30, 16:00 NY time
+            """
+            return df.between_time("09:30", "16:00")
+
+        if granularity == 'day':
+            cdl = self.oapi.polygon.historic_agg_v2(
+                dataname,
+                compression,
+                granularity,
+                _from=self.iso_date(dtbegin.isoformat()),
+                to=self.iso_date(dtend.isoformat())).df
+        else:
+            cdl = pd.DataFrame()
+            segment_start = dtbegin
+            segment_end = segment_start + timedelta(weeks=2) if \
+                dtend - dtbegin >= timedelta(weeks=2) else dtend
+            while segment_end <= dtend and dtend not in cdl.index:
+                response = self.oapi.polygon.historic_agg_v2(
+                    dataname,
+                    compression,
+                    granularity,
+                    _from=self.iso_date(segment_start.isoformat()),
+                    to=self.iso_date(segment_end.isoformat()))
+                # No result from the server, most likely error
+                if response.df.shape[0] == 0 and cdl.shape[0] == 0:
+                    raise Exception("received empty response")
+                temp = response.df
+                cdl = pd.concat([cdl, temp])
+                cdl = cdl[~cdl.index.duplicated()]
+                segment_start = segment_end
+                segment_end = segment_start + timedelta(weeks=2) if \
+                    dtend - dtbegin >= timedelta(weeks=2) else dtend
+            cdl = _clear_out_of_market_hours(cdl)
+        return cdl
+
+    def get_aggs_from_alpaca(self,
+                             dataname,
+                             start,
+                             end,
+                             granularity,
+                             compression):
+        """
+        https://alpaca.markets/docs/api-documentation/api-v2/market-data/bars/
+        Alpaca API as a limit of 1000 records per api call. meaning, we need to
+        do multiple calls to get all the required data if the date range is
+        large.
+        also, the alpaca api does not support compression (or, you can't get
+        5 minute bars e.g) so we need to resample the received bars.
+        also, we need to drop out of market records.
+        this function does all of that.
+
+        note:
+        this was the old way of getting the data
+          response = self.oapi.get_aggs(dataname,
+                                        compression,
+                                        granularity,
+                                        self.iso_date(start_dt),
+                                        self.iso_date(end_dt))
+          the thing is get_aggs work nicely for days but not for minutes, and
+          it is not a documented API. barset on the other hand does
+          but we need to manipulate it to be able to work with it
+          smoothly and return data the same way polygon does
+        """
+        def _iterate_api_calls():
+            """
+            you could get max 1000 samples from the server. if we need more
+            than that we need to do several api calls.
+
+            currently the alpaca api supports also 5Min and 15Min so we could
+            optimize server communication time by addressing timeframes
+            """
+            got_all = False
+            curr = end
+            response = []
+            while not got_all:
+                if granularity == 'minute' and compression == 5:
+                    timeframe = "5Min"
+                elif granularity == 'minute' and compression == 15:
+                    timeframe = "15Min"
+                else:
+                    timeframe = granularity
+                r = self.oapi.get_barset(dataname,
+                                         timeframe,
+                                         limit=1000,
+                                         end=curr.isoformat()
+                                         )[dataname]
+                if r:
+                    earliest_sample = r[0].t
+                    r = r._raw
+                    r.extend(response)
+                    response = r
+                    if earliest_sample <= (pytz.timezone(NY).localize(
+                            start) if not start.tzname() else start):
+                        got_all = True
+                    else:
+                        delta = timedelta(days=1) if granularity == "day" \
+                            else timedelta(minutes=1)
+                        curr = earliest_sample - delta
+                else:
+                    # no more data is available, let's return what we have
+                    break
+            return response
+
+        def _clear_out_of_market_hours(df):
+            """
+            only interested in samples between 9:30, 16:00 NY time
+            """
+            return df.between_time("09:30", "16:00")
+
+        def _drop_early_samples(df):
+            """
+            samples from server don't start at 9:30 NY time
+            let's drop earliest samples
+            """
+            for i, b in df.iterrows():
+                if i.time() == dtime(9, 30):
+                    return df[i:]
+
+        def _resample(df):
+            """
+            samples returned with certain window size (1 day, 1 minute) user
+            may want to work with different window size (5min)
+            """
+
+            if granularity == 'minute':
+                sample_size = f"{compression}Min"
+            else:
+                sample_size = f"{compression}D"
+            df = df.resample(sample_size).agg(
+                collections.OrderedDict([
+                    ('open', 'first'),
+                    ('high', 'max'),
+                    ('low', 'min'),
+                    ('close', 'last'),
+                    ('volume', 'sum'),
+                ])
+            )
+            if granularity == 'minute':
+                return df.between_time("09:30", "16:00")
+            else:
+                return df
+
+        # def _back_to_aggs(df):
+        #     response = []
+        #     for i, v in df.iterrows():
+        #         response.append({
+        #             "o": v.open,
+        #             "h": v.high,
+        #             "l": v.low,
+        #             "c": v.close,
+        #             "v": v.volume,
+        #             "t": i.timestamp() * 1000,
+        #         })
+        #     return Aggs({"results": response})
+
+        if not start:
+            response = self.oapi.get_barset(dataname,
+                                            granularity,
+                                            limit=1000,
+                                            end=end)[dataname]._raw
+        else:
+            response = _iterate_api_calls()
+        for bar in response:
+            # Aggs are in milliseconds, we multiply by 1000 to
+            # change seconds to ms
+            bar['t'] *= 1000
+        response = Aggs({"results": response})
+
+        cdl = response.df
+        if granularity == 'minute':
+            cdl = _clear_out_of_market_hours(cdl)
+            cdl = _drop_early_samples(cdl)
+        if compression != 1:
+            response = _resample(cdl)
+        # response = _back_to_aggs(cdl)
+        else:
+            response = response.df
+        response = response.dropna()
+        response = response[~response.index.duplicated()]
+        return response
 
     def streaming_prices(self, dataname, tmout=None):
         q = queue.Queue()
@@ -510,6 +710,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         bt.Order.Limit: 'limit',
         bt.Order.Stop: 'stop',
         bt.Order.StopLimit: 'stop_limit',
+        bt.Order.StopTrail: 'trailing_stop',
     }
 
     def broker_threads(self):
@@ -567,7 +768,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         okwargs['side'] = 'buy' if order.isbuy() else 'sell'
         okwargs['type'] = self._ORDEREXECS[order.exectype]
         okwargs['time_in_force'] = "gtc"
-        if order.exectype != bt.Order.Market:
+        if order.exectype not in [bt.Order.Market, bt.Order.StopTrail]:
             okwargs['limit_price'] = str(order.created.price)
 
         if order.exectype in [bt.Order.StopLimit, bt.Order.Stop]:
@@ -586,7 +787,21 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         if stopside or takeside:
             okwargs['order_class'] = "bracket"
 
-        okwargs.update(**kwargs)  # anything from the user
+        if order.exectype == bt.Order.StopTrail:
+            if order.trailpercent and order.trailamount:
+                raise Exception("You can't create trailing stop order with "
+                                "both TrailPrice and TrailPercent. choose one")
+            if order.trailpercent:
+                okwargs['trail_percent'] = order.trailpercent
+            elif order.trailamount:
+                okwargs['trail_price'] = order.trailamount
+            else:
+                raise Exception("You must provide either trailpercent or "
+                                "trailamount when creating StopTrail order")
+
+        # anything from the user
+        okwargs.update(order.info)
+        okwargs.update(**kwargs)
 
         self.q_ordercreate.put((order.ref, okwargs,))
         return order
